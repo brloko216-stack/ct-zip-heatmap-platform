@@ -1,0 +1,68 @@
+{
+  "urgent_care_premium": {
+    "label": "Urgent Care – Premium",
+    "description": "Healthcare focado em pacientes com bom insurance, renda média/alta e acesso rápido.",
+    "weights": {
+      "median_income": 0.28,
+      "insurance_coverage": 0.30,
+      "population_density": 0.12,
+      "age_25_64": 0.10,
+      "accessibility": 0.10,
+      "obesity_rate": 0.05,
+      "competition_inverted": 0.05
+    }
+  },
+
+  "gym_premium": {
+    "label": "Gym – Premium Franchise",
+    "description": "Academias premium dependem de renda alta, adultos economicamente ativos e baixa sensibilidade a preço.",
+    "weights": {
+      "median_income": 0.35,
+      "insurance_coverage": 0.05,
+      "age_25_64": 0.25,
+      "population_density": 0.10,
+      "accessibility": 0.10,
+      "obesity_rate": 0.05,
+      "competition_inverted": 0.10
+    }
+  },
+
+  "gym_budget": {
+    "label": "Gym – Budget / Low Cost",
+    "description": "Academias baratas focam volume, população jovem, maior obesidade e renda mais baixa.",
+    "weights": {
+      "low_income_index": 0.30,
+      "population_density": 0.25,
+      "age_18_34": 0.20,
+      "obesity_rate": 0.15,
+      "accessibility": 0.05,
+      "competition_inverted": 0.05
+    }
+  },
+
+  "fast_food_value": {
+    "label": "Fast Food – Value / High Volume",
+    "description": "Fast food barato depende de densidade, jovens, obesidade e acessibilidade.",
+    "weights": {
+      "population_density": 0.30,
+      "age_18_34": 0.20,
+      "low_income_index": 0.20,
+      "obesity_rate": 0.15,
+      "accessibility": 0.10,
+      "competition_inverted": 0.05
+    }
+  },
+
+  "fine_dining": {
+    "label": "Restaurant – Fine Dining",
+    "description": "Restaurantes finos precisam de renda alta, adultos maduros e menor foco em volume.",
+    "weights": {
+      "median_income": 0.40,
+      "age_35_64": 0.25,
+      "population_density": 0.10,
+      "accessibility": 0.10,
+      "competition_inverted": 0.10,
+      "insurance_coverage": 0.05
+    }
+  }
+}
