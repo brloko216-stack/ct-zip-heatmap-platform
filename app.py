@@ -1,292 +1,216 @@
 import json
 import os
-import streamlit as st
+import numpy as np
 import pandas as pd
+import streamlit as st
 import plotly.express as px
 
 st.set_page_config(page_title="CT ZIP Heatmap Platform", layout="wide")
 
-# ----------------------------
-# Login simples
-# ----------------------------
-APP_PASSWORD = st.secrets.get("APP_PASSWORD", "demo123")
-if "authed" not in st.session_state:
-    st.session_state.authed = False
-
-if not st.session_state.authed:
-    st.title("Client Login")
-    st.caption("Client-restricted access – Connecticut only")
-    pwd = st.text_input("Password", type="password")
-    if st.button("Enter"):
-        if pwd == APP_PASSWORD:
-            st.session_state.authed = True
-        else:
-            st.error("Wrong password")
-    st.markdown("""
-    **Notes**
-    - Indicative scores
-    - Decision-support only
-    - Aggregated public data (CT)
-    """)
-    st.stop()
-
-# ----------------------------
+# -----------------------
 # Helpers
-# ----------------------------
-REQUIRED_FEATURES = [
-    "zcta", "county",
-    "median_income",          # ACS (por ZIP/ZCTA)
-    "insurance_coverage",     # ACS (por ZIP/ZCTA) ou proxy
-    "population_density",     # proxy por ZIP (pop/area) ou outro
-    "age_18_34",
-    "age_25_64",
-    "age_35_64",
-    "low_income_index",       # 0-100 (você define)
-    "accessibility",          # 0-100 (proxy: drive time / highways etc.)
-    "competition"             # 0-100 (maior = mais concorrência)
-]
-
-def load_json(path: str):
+# -----------------------
+def load_geojson(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def normalize_0_100(series: pd.Series) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
-    lo = s.quantile(0.05)
-    hi = s.quantile(0.95)
-    if pd.isna(lo) or pd.isna(hi) or hi == lo:
-        return pd.Series([50] * len(series), index=series.index)  # fallback neutro
-    s = s.clip(lower=lo, upper=hi)
-    return ((s - lo) / (hi - lo) * 100).round(2)
+def get_zip_field(geojson: dict) -> str:
+    # Common TIGER/Line ZCTA fields
+    sample_props = geojson["features"][0].get("properties", {})
+    for k in ["ZCTA5CE20", "ZCTA5CE10", "ZCTA5CE"]:
+        if k in sample_props:
+            return k
+    # fallback: try any property that looks like ZCTA
+    for k in sample_props.keys():
+        if "ZCTA" in k.upper():
+            return k
+    return ""  # unknown
 
-def score_badge(score: int) -> str:
-    if score >= 82:
-        return "PROCEED"
-    if score >= 72:
-        return "CAUTION"
-    return "AVOID"
+def safe_read_csv(path: str) -> pd.DataFrame:
+    return pd.read_csv(path)
 
-def safe_read_csv(path: str):
-    if os.path.exists(path):
-        return pd.read_csv(path)
-    return None
+def normalize_0_100(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    if s.isna().all():
+        return pd.Series([50] * len(s), index=s.index)
+    mn, mx = np.nanmin(s), np.nanmax(s)
+    if mn == mx:
+        return pd.Series([50] * len(s), index=s.index)
+    return (s - mn) / (mx - mn) * 100
 
-def find_featureidkey(geojson: dict, candidate_keys: list[str]) -> str | None:
-    # tenta achar qual propriedade existe no primeiro feature
-    try:
-        props = geojson["features"][0]["properties"]
-    except Exception:
-        return None
-    for k in candidate_keys:
-        if k in props:
-            return f"properties.{k}"
-    return None
+# -----------------------
+# Load files
+# -----------------------
+GEOJSON_PATH = "ct_zcta.json"  # your uploaded file
+MODELS_PATH = "models.json"
+OBESITY_PATH = "obesity_by_county.csv"
+CROSSWALK_PATH = "zcta_to_county.csv"  # optional (you can add later)
 
-# ----------------------------
-# Load inputs
-# ----------------------------
-if not os.path.exists("models.json"):
-    st.error("Missing models.json in repo.")
+if not os.path.exists(GEOJSON_PATH):
+    st.error(f"Missing {GEOJSON_PATH} in repo root.")
     st.stop()
 
-MODELS = load_json("models.json")
-
-zcta_df = safe_read_csv("ct_zcta_features.csv")  # << seu dataset REAL por ZIP/ZCTA
-ob_df = safe_read_csv("obesity_by_county.csv")   # << seu dataset REAL por county
-
-# Sidebar controls
-st.sidebar.title("CT Heatmap Platform")
-model_key = st.sidebar.selectbox(
-    "Tipo de negócio",
-    list(MODELS.keys()),
-    format_func=lambda k: MODELS[k].get("label", k),
-)
-
-geo_mode = st.sidebar.radio("Mapa por", ["ZIP (ZCTA)", "County"], index=0)
-
-st.sidebar.divider()
-st.sidebar.caption("Cores = pontuação (0–100).")
-
-# ----------------------------
-# Validate dataset
-# ----------------------------
-if zcta_df is None:
-    st.error("Faltou o arquivo **ct_zcta_features.csv** no repo. Adicione ele e tente novamente.")
+geo = load_geojson(GEOJSON_PATH)
+zip_field = get_zip_field(geo)
+if not zip_field:
+    st.error("Could not detect ZIP field in GeoJSON properties. Expected ZCTA5CE20-like field.")
     st.stop()
 
-missing_cols = [c for c in REQUIRED_FEATURES if c not in zcta_df.columns]
-if missing_cols:
-    st.error(f"ct_zcta_features.csv está faltando colunas: {missing_cols}")
-    st.stop()
+# Create a base table of ZIPs from GeoJSON
+zips = []
+for feat in geo["features"]:
+    props = feat.get("properties", {})
+    z = str(props.get(zip_field, "")).strip()
+    if z:
+        zips.append(z)
+base = pd.DataFrame({"zcta": sorted(set(zips))})
 
-df = zcta_df.copy()
-df["zcta"] = df["zcta"].astype(str).str.zfill(5)
+models = {}
+if os.path.exists(MODELS_PATH):
+    with open(MODELS_PATH, "r", encoding="utf-8") as f:
+        models = json.load(f)
 
-# Merge obesity by county (optional)
-if ob_df is not None and "county" in ob_df.columns and "obesity_rate" in ob_df.columns:
-    df = df.merge(ob_df[["county", "obesity_rate"]], on="county", how="left")
-else:
-    df["obesity_rate"] = pd.NA  # não quebra o app
+# -----------------------
+# UI
+# -----------------------
+st.title("CT ZIP Heatmap Platform")
 
-# Derived: competition inverted (melhor quando concorrência é menor)
-df["competition_inverted"] = 100 - pd.to_numeric(df["competition"], errors="coerce")
+colA, colB, colC = st.columns([1.2, 1, 1])
+with colA:
+    model_names = list(models.keys()) if isinstance(models, dict) and models else [
+        "Urgent Care (Premium)",
+        "Gym (Premium)",
+        "Gym (Budget)",
+        "Fast Food (Budget)",
+        "Fine Dining"
+    ]
+    chosen_model = st.selectbox("Business model", model_names, index=0)
 
-# ----------------------------
-# Normalize features to 0-100
-# (para que pesos funcionem consistentemente)
-# ----------------------------
-# Aqui você pode adicionar/remover features conforme seu dataset REAL.
-norm_cols = [
-    "median_income",
-    "insurance_coverage",
-    "population_density",
-    "age_18_34",
-    "age_25_64",
-    "age_35_64",
-    "low_income_index",
-    "accessibility",
-    "obesity_rate",
-    "competition_inverted"
-]
+with colB:
+    animate = st.toggle("Animated reveal", value=True)
 
-for col in norm_cols:
-    if col not in df.columns:
-        df[col] = pd.NA
-    df[col + "_n"] = normalize_0_100(df[col])
+with colC:
+    map_style = st.selectbox("Map style", ["carto-positron", "open-street-map"], index=0)
 
-# ----------------------------
-# Score engine (model weights)
-# ----------------------------
-weights = MODELS[model_key]["weights"]
+# -----------------------
+# Build features (real if available, else placeholder)
+# -----------------------
+df = base.copy()
 
-# Weights referem-se aos nomes "base" (sem _n). Ex: median_income -> median_income_n
-needed = []
-for feat in weights.keys():
-    if feat.endswith("_inverted"):
-        base = feat  # competition_inverted
+# Optional: apply obesity (county) if we have a crosswalk ZIP->county + obesity_by_county
+has_crosswalk = os.path.exists(CROSSWALK_PATH)
+has_obesity = os.path.exists(OBESITY_PATH)
+
+if has_crosswalk:
+    cw = safe_read_csv(CROSSWALK_PATH)
+    # expected columns: zcta, county (case-insensitive)
+    cols = {c.lower(): c for c in cw.columns}
+    if "zcta" not in cols or "county" not in cols:
+        st.warning("zcta_to_county.csv exists but must have columns: zcta, county")
     else:
-        base = feat
-    if base + "_n" not in df.columns:
-        needed.append(base)
+        cw = cw.rename(columns={cols["zcta"]: "zcta", cols["county"]: "county"})
+        cw["zcta"] = cw["zcta"].astype(str).str.zfill(5)
+        df = df.merge(cw[["zcta", "county"]], on="zcta", how="left")
 
-if needed:
-    st.error(f"Modelo exige features que não existem no dataset: {needed}")
-    st.stop()
+if has_obesity and "county" in df.columns:
+    ob = safe_read_csv(OBESITY_PATH)
+    # try to detect columns
+    ob_cols = {c.lower(): c for c in ob.columns}
+    # common possibilities
+    county_col = ob_cols.get("county") or ob_cols.get("name") or list(ob.columns)[0]
+    rate_col = None
+    for k in ["obesity", "obesity_rate", "rate", "value", "percent", "pct"]:
+        if k in ob_cols:
+            rate_col = ob_cols[k]
+            break
+    if rate_col is None and len(ob.columns) >= 2:
+        rate_col = list(ob.columns)[1]
 
-df["final_score"] = 0.0
-for feat, w in weights.items():
-    df["final_score"] += df[feat + "_n"] * float(w)
-
-df["final_score"] = df["final_score"].round(0).astype(int)
-df["recommendation"] = df["final_score"].apply(score_badge)
-
-# ----------------------------
-# Header
-# ----------------------------
-st.title("Connecticut Heatmap (ZIP / County)")
-st.caption(f"Modelo: **{MODELS[model_key].get('label', model_key)}**")
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Avg score", int(df["final_score"].mean()))
-c2.metric("Top score", int(df["final_score"].max()))
-c3.metric("Bottom score", int(df["final_score"].min()))
-c4.metric("ZIPs", df["zcta"].nunique())
-
-st.divider()
-
-# ----------------------------
-# Table views
-# ----------------------------
-top = df.sort_values("final_score", ascending=False).head(15)
-bottom = df.sort_values("final_score", ascending=True).head(15)
-
-t1, t2 = st.tabs(["Top ZIPs", "Bottom ZIPs"])
-with t1:
-    st.dataframe(top[["zcta", "county", "final_score", "recommendation"]], use_container_width=True)
-with t2:
-    st.dataframe(bottom[["zcta", "county", "final_score", "recommendation"]], use_container_width=True)
-
-st.divider()
-
-# ----------------------------
-# Map (ZIP choropleth preferred)
-# ----------------------------
-center_ct = {"lat": 41.6, "lon": -72.7}
-
-if geo_mode == "ZIP (ZCTA)":
-    if not os.path.exists("ct_zcta_ct.geojson"):
-        st.warning("Faltou **ct_zcta_ct.geojson** (polígonos ZCTA de CT). Sem ele não dá pra pintar ZIP por cor.")
-        st.stop()
-
-    with open("ct_zcta_ct.geojson", "r", encoding="utf-8") as f:
-        geo = json.load(f)
-
-    # Chaves comuns dentro de GeoJSON de ZCTA
-    featureidkey = find_featureidkey(geo, ["ZCTA5CE20", "ZCTA5CE10", "ZCTA5CE00", "ZCTA5"])
-    if featureidkey is None:
-        st.error("Não consegui achar a chave do ZCTA dentro do GeoJSON. Me mande um print do primeiro feature/properties.")
-        st.stop()
-
-    fig = px.choropleth_mapbox(
-        df,
-        geojson=geo,
-        locations="zcta",
-        featureidkey=featureidkey,
-        color="final_score",
-        hover_data={"county": True, "recommendation": True, "final_score": True},
-        mapbox_style="open-street-map",
-        zoom=7.2,
-        center=center_ct,
-        opacity=0.70,
-        height=620
-    )
-    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
-    st.plotly_chart(fig, use_container_width=True)
-
+    ob = ob.rename(columns={county_col: "county", rate_col: "obesity_rate"})
+    df = df.merge(ob[["county", "obesity_rate"]], on="county", how="left")
 else:
-    # County choropleth
-    if not os.path.exists("ct_county_ct.geojson"):
-        st.warning("Faltou **ct_county_ct.geojson** (polígonos de county). Adicione e ele pinta por county.")
-        st.stop()
+    df["obesity_rate"] = np.nan
 
-    with open("ct_county_ct.geojson", "r", encoding="utf-8") as f:
-        cgeo = json.load(f)
+# Placeholder metrics (until you add ACS-by-ZIP)
+# These keep the app working + demoable while we plug real sources.
+rng = np.random.default_rng(42)
+df["median_income"] = rng.normal(85000, 12000, len(df)).clip(35000, 160000)
+df["insurance_coverage"] = rng.normal(0.92, 0.03, len(df)).clip(0.75, 0.99) * 100
+df["population_density"] = rng.normal(1800, 900, len(df)).clip(50, 9000)
 
-    # Agrega score por county (média)
-    cdf = df.groupby("county", as_index=False).agg(
-        final_score=("final_score", "mean"),
-        zips=("zcta", "nunique")
-    )
-    cdf["final_score"] = cdf["final_score"].round(0).astype(int)
-    cdf["recommendation"] = cdf["final_score"].apply(score_badge)
+# Obesity: if we have real values, use them; else synthesize
+if df["obesity_rate"].isna().all():
+    df["obesity_rate"] = rng.normal(28, 4, len(df)).clip(18, 40)
 
-    featureidkey = find_featureidkey(cgeo, ["NAME", "NAMELSAD", "COUNTYNAME"])
-    if featureidkey is None:
-        st.error("Não achei o nome do county dentro do GeoJSON (properties). Me mande um print do primeiro feature/properties.")
-        st.stop()
+# -----------------------
+# Scoring per business model
+# -----------------------
+# If models.json is present, we use weights from there; else use defaults.
+default_weights = {
+    "Urgent Care (Premium)": {"median_income": 0.35, "insurance_coverage": 0.40, "population_density": 0.20, "obesity_rate": -0.05},
+    "Gym (Premium)":         {"median_income": 0.45, "insurance_coverage": 0.15, "population_density": 0.30, "obesity_rate": -0.10},
+    "Gym (Budget)":          {"median_income": -0.10, "insurance_coverage": 0.05, "population_density": 0.55, "obesity_rate": 0.50},
+    "Fast Food (Budget)":    {"median_income": -0.35, "insurance_coverage": -0.05, "population_density": 0.40, "obesity_rate": 0.60},
+    "Fine Dining":           {"median_income": 0.60, "insurance_coverage": 0.15, "population_density": 0.25, "obesity_rate": -0.10},
+}
 
-    fig = px.choropleth_mapbox(
-        cdf,
-        geojson=cgeo,
-        locations="county",
-        featureidkey=featureidkey,
-        color="final_score",
-        hover_data={"zips": True, "recommendation": True, "final_score": True},
-        mapbox_style="open-street-map",
-        zoom=7.2,
-        center=center_ct,
-        opacity=0.70,
-        height=620
-    )
-    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
-    st.plotly_chart(fig, use_container_width=True)
+weights = None
+if isinstance(models, dict) and chosen_model in models and isinstance(models[chosen_model], dict):
+    weights = models[chosen_model].get("weights")
+if not weights:
+    weights = default_weights.get(chosen_model, default_weights["Urgent Care (Premium)"])
 
-# ----------------------------
-# Export
-# ----------------------------
-st.download_button(
-    "Download scored ZIPs (CSV)",
-    data=df[["zcta", "county", "final_score", "recommendation"]].to_csv(index=False).encode("utf-8"),
-    file_name="ct_scored_zips.csv",
-    mime="text/csv",
+# Normalize metrics and compute score
+score = 0
+for feat, w in weights.items():
+    if feat not in df.columns:
+        continue
+    val = normalize_0_100(df[feat])
+    score += w * val
+
+df["score"] = normalize_0_100(pd.Series(score))
+
+# Optional "animation" = reveal by deciles
+if animate:
+    df["band"] = pd.qcut(df["score"], 10, labels=[f"D{i}" for i in range(1, 11)])
+    df["band_order"] = df["band"].str.replace("D", "").astype(int)
+else:
+    df["band"] = "All"
+    df["band_order"] = 1
+
+# -----------------------
+# Map
+# -----------------------
+st.subheader("ZIP Heatmap")
+
+# Plotly needs a featureid key path to match zcta values
+featureid_key = f"properties.{zip_field}"
+
+fig = px.choropleth_mapbox(
+    df.sort_values("band_order"),
+    geojson=geo,
+    locations="zcta",
+    featureidkey=featureid_key,
+    color="score",
+    hover_data={
+        "zcta": True,
+        "score": ':.1f',
+        "median_income": ':.0f',
+        "insurance_coverage": ':.1f',
+        "population_density": ':.0f',
+        "obesity_rate": ':.1f',
+        "band": True
+    },
+    animation_frame="band" if animate else None,
+    mapbox_style=map_style,
+    zoom=7.2,
+    center={"lat": 41.6, "lon": -72.7},
+    opacity=0.75,
 )
+
+fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
+st.plotly_chart(fig, use_container_width=True)
+
+st.caption("Nota: enquanto não plugamos ACS por ZIP, alguns indicadores estão como placeholder só para validar o produto.")
+if not has_crosswalk:
+    st.info("Para aplicar obesidade (county) em ZIP, adicione um arquivo zcta_to_county.csv com colunas: zcta, county.")
